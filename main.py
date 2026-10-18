@@ -62,10 +62,10 @@ def extract_number_runs(pdf_path):
     runs = []
     for page in extract_pages(pdf_path):
         digits = [c for c in iter_chars(page) if c.get_text().isdigit()]
-        digits.sort(key=lambda c: (-round(c.y0), c.x0))
+        digits.sort(key=lambda c: (-round(c.y0 / 3), c.x0))
         current, last = "", None
         for c in digits:
-            same_run = (last is not None and round(c.y0) == round(last.y0)
+            same_run = (last is not None and abs(c.y0 - last.y0) < 3
                         and abs(c.x0 - last.x1) < c.width * 0.5)
             if not same_run and current:
                 runs.append(current)
@@ -77,13 +77,26 @@ def extract_number_runs(pdf_path):
     return runs
 
 
+def normalize_id(text):
+    """מחזיר ת.ז בת 9 ספרות אם הקלט תקין (כולל ת.ז ישנה בת 8 ספרות בלי 0 מוביל), אחרת None"""
+    digits = re.sub(r"\D", "", text or "")
+    if len(digits) == 8:
+        digits = "0" + digits
+    return digits if is_valid_israeli_id(digits) else None
+
+
 def extract_certificate_fields(pdf_path):
-    """שולף ת.ז (9 ספרות עם ספרת ביקורת תקינה) ואת כל המספרים שבתעודה"""
+    """שולף ת.ז (עם ספרת ביקורת תקינה) ואת כל המספרים שבתעודה"""
     runs = extract_number_runs(pdf_path)
     # גיבוי: קבצים שבהם הטקסט כן מופרד כרגיל
     runs += re.findall(r"(?<!\d)\d+(?!\d)", extract_text(pdf_path))
 
-    id_number = next((r for r in runs if is_valid_israeli_id(r)), None)
+    # עדיפות ל-9 ספרות, ואחר כך ת.ז ישנה בת 8 ספרות
+    id_number = (next((r for r in runs if len(r) == 9 and is_valid_israeli_id(r)), None)
+                 or next((normalize_id(r) for r in runs if len(r) == 8 and normalize_id(r)), None))
+    if not id_number:
+        # PDF עברי שמאחסן ספרות בסדר חזותי הפוך
+        id_number = next((r[::-1] for r in runs if len(r) == 9 and is_valid_israeli_id(r[::-1])), None)
     return id_number, set(runs)
 
 
@@ -346,25 +359,37 @@ def main():
     uploaded_file = st.file_uploader("קובץ התעודה (PDF)", type=["pdf"],
                                      help="יש להעלות את קובץ ה-PDF המקורי של התעודה, לא צילום מסך.")
 
+    with st.expander("המערכת לא הצליחה לקרוא את הקובץ? אפשר להקליד ת.ז ידנית"):
+        manual_id = st.text_input("מספר תעודת זהות (לא חובה)", max_chars=9,
+                                  placeholder="9 ספרות, כולל ספרת ביקורת")
+
     if not st.button("🔍 בדיקת התעודה", type="primary", width="stretch",
-                     disabled=uploaded_file is None):
+                     disabled=uploaded_file is None and not manual_id.strip()):
         st.markdown('<div class="footnote">⏱️ הבדיקה לוקחת בדרך כלל כ-10 שניות · '
                     "מתבצעת מול מאגר ציבורי של משרד העבודה · הקובץ לא נשמר במערכת</div>",
                     unsafe_allow_html=True)
         return
 
     with st.status("בודקים את התעודה... התהליך עשוי לקחת כ-10 שניות ⏱️", expanded=True) as status:
-        st.write("📄 קוראים את פרטי התעודה מהקובץ...")
-        # שמירה לקובץ זמני ייחודי - בטוח גם כשכמה משתמשים מריצים במקביל
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            temp_path = tmp.name
-        try:
-            id_number, pdf_numbers = extract_certificate_fields(temp_path)
-        except Exception:
-            id_number, pdf_numbers = None, set()
-        finally:
-            os.remove(temp_path)
+        id_number, pdf_numbers, read_error = None, set(), None
+        if uploaded_file is not None:
+            st.write("📄 קוראים את פרטי התעודה מהקובץ...")
+            # שמירה לקובץ זמני ייחודי - בטוח גם כשכמה משתמשים מריצים במקביל
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                temp_path = tmp.name
+            try:
+                id_number, pdf_numbers = extract_certificate_fields(temp_path)
+            except Exception as e:
+                read_error = f"{type(e).__name__}: {e}"
+            finally:
+                os.remove(temp_path)
+
+        manual_error = False
+        if manual_id.strip():
+            # ת.ז שהוקלדה ידנית גוברת על מה שנקרא מהקובץ
+            id_number = normalize_id(manual_id)
+            manual_error = id_number is None
 
         if not id_number:
             status.update(label="לא הצלחנו לקרוא את התעודה", state="error", expanded=False)
@@ -378,9 +403,20 @@ def main():
                 status.update(label="הבדיקה הושלמה", state="complete", expanded=False)
 
     if not id_number:
+        if manual_error:
+            render_card("warning", "🔢", "מספר תעודת הזהות שהוקלד לא תקין",
+                        "יש לבדוק שהוקלדו 9 ספרות מלאות, כולל ספרת הביקורת בסוף.")
+            return
         render_card("warning", "📄", "לא מצאנו מספר תעודת זהות בקובץ",
-                    "כדאי לוודא שזה קובץ ה-PDF המקורי שהתקבל ממשרד העבודה. "
-                    "קובץ סרוק או צילום מסך לא מכיל טקסט שאפשר לקרוא.")
+                    "ייתכן שהקובץ סרוק או בנוי אחרת מהרגיל. אפשר להקליד את מספר ת.ז ידנית "
+                    "בחלון \"אפשר להקליד ת.ז ידנית\" שמעל הכפתור, וללחוץ שוב על בדיקה.")
+        with st.expander("פרטים טכניים (למי שמתחזק את המערכת)"):
+            if read_error:
+                st.code(f"שגיאה בקריאת ה-PDF: {read_error}", language=None)
+            else:
+                found = sorted(pdf_numbers, key=len, reverse=True)
+                st.code("מספרים שנמצאו בקובץ: " + (", ".join(found) if found else "(אין טקסט בקובץ - כנראה סרוק)"),
+                        language=None)
         return
 
     show_verdict(search, id_number, pdf_numbers)
