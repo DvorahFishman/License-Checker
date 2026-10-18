@@ -1,3 +1,10 @@
+import streamlit as st
+
+
+st.title("מערכת לאימות תעודות מורשה להיתר")
+st.write("העלי קובץ PDF לבדיקה:")
+uploaded_file = st.file_uploader("בחר קובץ PDF", type=["pdf"])
+
 def verify_license_in_gov_site(id_number):
     url = "https://dataquery.labor.gov.il/businessLicense/s/#"
     
