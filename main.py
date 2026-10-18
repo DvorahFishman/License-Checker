@@ -2,8 +2,6 @@ def verify_license_in_gov_site(id_number):
     url = "https://dataquery.labor.gov.il/businessLicense/s/#"
     
     options = webdriver.ChromeOptions()
-    # שימי לב: הוספתי סולמית (#) לפני ה-headless כדי שהדפדפן יקפוץ לך במחשב.
-    # לפני שתעלי את זה חזרה ל-GitHub ולענן, תורידי את הסולמית כדי שזה יעבוד שם!
     # options.add_argument('--headless=new') 
     
     options.add_argument('--no-sandbox') 
