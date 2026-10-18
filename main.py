@@ -1,74 +1,70 @@
+import os
+import re
+import time
+from pdfminer.high_level import extract_text
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import streamlit as st
 
 
-st.title("מערכת לאימות תעודות מורשה להיתר")
-st.write("העלי קובץ PDF לבדיקה:")
-uploaded_file = st.file_uploader("בחר קובץ PDF", type=["pdf"])
 
-def verify_license_in_gov_site(id_number):
-    url = "https://dataquery.labor.gov.il/businessLicense/s/#"
-    
-    options = webdriver.ChromeOptions()
-    # options.add_argument('--headless=new') 
-    
-    options.add_argument('--no-sandbox') 
-    options.add_argument('--disable-dev-shm-usage') 
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--disable-gpu')
-    
-    driver = webdriver.Chrome(options=options)
-    
+
+def extract_id_from_pdf(pdf_path):
+    """שולף תעודת זהות בת 9 ספרות מקובץ ה-PDF"""
     try:
+        text = extract_text(pdf_path)
+        ids = re.findall(r'\b\d{9}\b', text)
+        if ids:
+            return ids[0]
+        return None
+    except Exception as e:
+        st.error(f"שגיאה בקריאת קובץ ה-PDF: {e}")
+        return None
+
+
+
+
+def verify_license_in_gov_site(pdf_path):
+    """מבצע אימות של תעודת הזהות מול אתר הממשלה באמצעות Selenium בערך Headless"""
+    id_number = extract_id_from_pdf(pdf_path)
+    if not id_number:
+        return "❌ שגיאה: לא נמצאה תעודת זהות בת 9 ספרות בקובץ ה-PDF."
+
+
+    st.info(f"🔍 חולצה תעודת זהות: **{id_number}**. מתחיל אימות מול האתר...")
+
+
+    # הגדרות הרצה שקטה (Headless) עבור Selenium
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        url = "https://www.gov.il/he/service/licensed-architects-and-engineers-registry"
         driver.get(url)
+
+
         wait = WebDriverWait(driver, 15)
-        
-        murshe_radio = wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'מורשה להיתר')]")))
-        driver.execute_script("arguments[0].click();", murshe_radio)
+
+
+        # 1. בחירת "מורשה להיתר"
+        license_type_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//label[contains(., 'מורשה להיתר')]"))
+        )
+        license_type_button.click()
         time.sleep(1)
 
 
-        tz_radio = wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'תעודת זהות')]")))
-        driver.execute_script("arguments[0].click();", tz_radio)
-        time.sleep(1)
-
-
-        search_box = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[contains(@class, 'vlocity-input')]")))
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", search_box)
-        time.sleep(1)
-        
-        search_box.click()
-        time.sleep(0.5)
-        
-        actions = ActionChains(driver)
-        actions.send_keys_to_element(search_box, id_number)
-        actions.perform()
-        
-        time.sleep(0.5)
-        driver.execute_script(f"arguments[0].value = '{id_number}';", search_box)
-        driver.execute_script("""
-            arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
-            arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
-            arguments[0].dispatchEvent(new Event('blur', { bubbles: true }));
-        """, search_box)
-        
-        actions.send_keys(Keys.TAB).perform()
-        time.sleep(1)
-
-
-        search_button = wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'חפש') or contains(., 'חיפוש')]")))
-        driver.execute_script("arguments[0].click();", search_button)
-        
-        time.sleep(5) 
-        
-        page_source = driver.page_source
-        # התיקון הקריטי לפי תמונת המסך שלך:
-        if "לא מצאנו תוצאות עבור החיפוש שלך" in page_source:
-            return False
-        else:
-            return True
-            
-    except Exception:
-        return False
-    finally:
-        time.sleep(3) # השהייה קצרה שתספיקי לראות לפני שנסגר
-        driver.quit()
+        # 2. בחירת "תעודת זהות"
+        id_radio_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//label[contains(., 'תעודת זהות')]"))
+        )
