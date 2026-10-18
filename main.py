@@ -28,7 +28,7 @@ def extract_id_from_pdf(pdf_path):
 
 
 def verify_license_in_gov_site(pdf_path):
-    """מבצע אימות של תעודת הזהות מול אתר הממשלה באמצעות Selenium בערך Headless"""
+    """מבצע אימות של תעודת הזהות מול אתר הממשלה באמצעות Selenium"""
     id_number = extract_id_from_pdf(pdf_path)
     if not id_number:
         return "❌ שגיאה: לא נמצאה תעודת זהות בת 9 ספרות בקובץ ה-PDF."
@@ -37,7 +37,6 @@ def verify_license_in_gov_site(pdf_path):
     st.info(f"🔍 חולצה תעודת זהות: **{id_number}**. מתחיל אימות מול האתר...")
 
 
-    # הגדרות הרצה שקטה (Headless) עבור Selenium
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -68,3 +67,78 @@ def verify_license_in_gov_site(pdf_path):
         id_radio_button = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//label[contains(., 'תעודת זהות')]"))
         )
+        id_radio_button.click()
+        time.sleep(1)
+
+
+        # 3. הקלדת תעודת הזהות
+        input_field = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[type='number']"))
+        )
+        input_field.clear()
+        for char in id_number:
+            input_field.send_keys(char)
+            time.sleep(0.05)
+
+
+        # 4. לחיצה על כפתור חיפוש
+        search_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'חפש')]"))
+        )
+        search_button.click()
+
+
+        time.sleep(3)
+        page_source = driver.page_source
+
+
+        if "לא מצאנו תוצאות עבור החיפוש שלך" in page_source:
+            return "❌ תוצאה: התעודה לא נמצאה במאגר! (חשד לזיוף או פרטים לא תקינים)"
+        else:
+            return "✅ תוצאה: התעודה תקינה! (נמצאה במאגר)"
+
+
+    except Exception as e:
+        return f"❌ שגיאה במהלך התחברות או סריקת האתר: {e}"
+    finally:
+        if driver:
+            driver.quit()
+
+
+
+
+def main():
+    st.set_page_config(page_title="אימות תעודה מורשה להיתר", page_icon="📜")
+    
+    st.title("📜 מערכת לאימות תעודות מורשה להיתר")
+    st.write("העלי קובץ PDF לבדיקה מול מאגר הממשלה:")
+
+
+    uploaded_file = st.file_uploader("בחר קובץ PDF", type=["pdf"])
+
+
+    if uploaded_file is not None:
+        temp_path = "temp_uploaded.pdf"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+
+        if st.button("בצע בדיקה"):
+            with st.spinner("מבצע אימות ברקע, אנא המתיני..."):
+                result = verify_license_in_gov_site(temp_path)
+
+
+            if "✅" in result:
+                st.success(result)
+            else:
+                st.error(result)
+
+
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+
+
+if __name__ == "__main__":
+    main()
