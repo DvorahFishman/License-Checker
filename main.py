@@ -3,7 +3,6 @@ import os
 import re
 import shutil
 import tempfile
-from datetime import date, datetime
 from pdfminer.high_level import extract_pages, extract_text
 from pdfminer.layout import LTChar, LTContainer
 from selenium import webdriver
@@ -14,10 +13,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 import streamlit as st
 
 
-# שאילתת פנקס המהנדסים והאדריכלים של משרד העבודה
-# (הכתובת הישנה ב-gov.il מפנה היום לדף שגיאה)
-REGISTRY_URL = "https://data.labor.gov.il/EngineersAndArchitects.aspx"
-NOT_FOUND_TEXT = "לא נמצאו נתונים"
+# שאילתת "מורשה להיתר" של אגף אסדרת עיסוקים במשרד העבודה.
+# האתר מציג רק מורשי היתר שתעודתם בתוקף (שונה מפנקס המהנדסים הכללי).
+PERMIT_URL = "https://dataquery.labor.gov.il/businessLicense/s/"
 
 # האתר חוסם דפדפן שמזדהה כ-HeadlessChrome, לכן מזדהים כ-Chrome רגיל
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -26,6 +24,42 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # נתיבים אפשריים לדפדפן ול-driver בשרת Linux (Streamlit Cloud / Debian)
 CHROMIUM_BINARY_CANDIDATES = ["/usr/bin/chromium", "/usr/bin/chromium-browser"]
 CHROMEDRIVER_CANDIDATES = ["/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver"]
+
+# שדה הזנת ת.ז באתר הוא רכיב Salesforce בתוך shadow DOM, ולכן ניגשים אליו דרך JavaScript
+FIND_VISIBLE_TEXT_INPUT_JS = """
+function walk(root) {
+  for (const el of root.querySelectorAll('*')) {
+    if (el.tagName === 'INPUT' && el.type === 'text' && el.offsetParent !== null) return el;
+    if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
+  }
+  return null;
+}
+return walk(document);
+"""
+
+FIND_SEARCH_BUTTON_JS = """
+function walk(root) {
+  for (const el of root.querySelectorAll('button')) {
+    if (el.innerText.trim() === 'חפש' && el.offsetParent !== null) return el;
+  }
+  for (const el of root.querySelectorAll('*')) {
+    if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
+  }
+  return null;
+}
+return walk(document);
+"""
+
+# הרכיב מתעלם מהקלדה רגילה (שדה עם מסכה), לכן מציבים ערך ושולחים את האירועים שהוא מאזין להם
+SET_VALUE_JS = """
+const el = arguments[0];
+el.focus();
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+setter.call(el, arguments[1]);
+for (const name of ['input', 'change', 'blur']) {
+  el.dispatchEvent(new Event(name, {bubbles: true, composed: true}));
+}
+"""
 
 
 def find_first_existing(paths):
@@ -100,6 +134,13 @@ def extract_certificate_fields(pdf_path):
     return id_number, set(runs)
 
 
+def certificate_number_in_pdf(cert_number, pdf_numbers):
+    """מספר התעודה באתר ('01-002-0000000121') מול רצפי הספרות שב-PDF.
+    משווים את הקטע האחרון, בלי אפסים מובילים."""
+    last_part = cert_number.split("-")[-1].lstrip("0")
+    return bool(last_part) and any(r.lstrip("0") == last_part and len(r) >= 4 for r in pdf_numbers)
+
+
 def build_driver():
     """יוצר Chrome WebDriver - מזהה אוטומטית אם רצים בענן (chromium מותקן) או מקומית"""
     chrome_options = Options()
@@ -126,56 +167,71 @@ def build_driver():
     return webdriver.Chrome(options=chrome_options)
 
 
-def search_registry(id_number):
-    """מחפש ת.ז בפנקס המהנדסים והאדריכלים.
-    מחזיר dict: found, name, rows (רשימת dict לפי כותרות הטבלה), error, screenshot"""
-    result = {"found": False, "name": None, "rows": [], "error": None, "screenshot": None}
+def search_permit_holder(id_number):
+    """מחפש ת.ז ברשימת המורשים להיתר של משרד העבודה.
+    מחזיר dict: found, name, cert_number, issue_date, error, screenshot, blocked"""
+    result = {"found": False, "name": None, "cert_number": None, "issue_date": None,
+              "error": None, "screenshot": None, "blocked": False}
     driver = None
     step = "הפעלת הדפדפן"
     try:
         driver = build_driver()
 
-        step = "טעינת אתר הפנקס"
-        driver.get(REGISTRY_URL)
-        wait = WebDriverWait(driver, 20)
-        wait.until(lambda d: d.find_elements(By.ID, "txtID"))
+        step = "טעינת אתר משרד העבודה"
+        driver.get(PERMIT_URL)
+        wait = WebDriverWait(driver, 30)
+        permit_label_xpath = "//input[@value='ROO']/following-sibling::label"
+        wait.until(lambda d: d.find_elements(By.XPATH, permit_label_xpath))
 
-        step = "הקלדת תעודת הזהות"
-        driver.find_element(By.ID, "Rdb_ID").click()
-        input_field = driver.find_element(By.ID, "txtID")
-        input_field.clear()
-        input_field.send_keys(id_number)
+        step = "בחירת 'מורשה להיתר'"
+        driver.find_element(By.XPATH, permit_label_xpath).click()
+
+        step = "בחירת חיפוש לפי תעודת זהות"
+        id_label = wait.until(lambda d: next(
+            (el for el in d.find_elements(By.XPATH, "//input[@value='TZId']/following-sibling::label")
+             if el.is_displayed()), None))
+        id_label.click()
+
+        step = "הזנת תעודת הזהות"
+        field = wait.until(lambda d: d.execute_script(FIND_VISIBLE_TEXT_INPUT_JS))
+        driver.execute_script(SET_VALUE_JS, field, id_number)
 
         step = "לחיצה על חיפוש"
-        driver.find_element(By.ID, "imgBtnSearch").click()
+        button = wait.until(lambda d: d.execute_script(FIND_SEARCH_BUTTON_JS))
+        button.click()
 
         step = "המתנה לתוצאה"
 
+        def body_text(d):
+            return d.find_element(By.TAG_NAME, "body").text
+
         def result_ready(d):
-            validation = d.find_elements(By.ID, "lblValidation")
-            if validation and validation[0].text.strip():
-                return True
-            return bool(d.find_elements(By.CSS_SELECTOR, "#tdResult table.tbl2"))
+            # כותרת "תוצאות חיפוש" מופיעה לפני התוצאה עצמה, לכן ממתינים לתעודה או ל-2 הודעות "לא מצאנו"
+            # (אחת לכל סוג עיסוק באתר)
+            t = body_text(d)
+            if "תוצאות חיפוש" not in t:
+                return "שגיאה:" in t
+            return "מספר תעודה:" in t or t.count("לא מצאנו תוצאות") >= 2
 
         wait.until(result_ready)
+        text = body_text(driver)
 
-        validation = driver.find_elements(By.ID, "lblValidation")
-        validation_text = validation[0].text.strip() if validation else ""
-        if NOT_FOUND_TEXT in validation_text:
-            return result
-        if validation_text:
-            result["error"] = f"האתר החזיר הודעה: {validation_text}"
+        if "שגיאה:" in text and "תוצאות חיפוש" not in text:
+            result["error"] = "האתר דחה את החיפוש: " + text.split("שגיאה:", 1)[1].splitlines()[0].strip()
             return result
 
-        step = "קריאת טבלת התוצאות"
-        title = driver.find_elements(By.CSS_SELECTOR, "#tdResult .tdTitle")
-        result["name"] = title[0].text.strip() if title else None
-        headers = [h.text.strip() for h in driver.find_elements(By.CSS_SELECTOR, "#tdResult .tbl2 .tdHeader")]
-        for tr in driver.find_elements(By.CSS_SELECTOR, "#tdResult .tbl2 tr"):
-            cells = [td.text.strip() for td in tr.find_elements(By.CSS_SELECTOR, "td.td2")]
-            if cells:
-                result["rows"].append(dict(zip(headers, cells)))
-        result["found"] = True
+        step = "קריאת התוצאה"
+        cert = re.search(r"מספר תעודה:\s*([\d\-]+)", text)
+        cert_type = re.search(r"סוג תעודה:\s*(.+)", text)
+        if not cert or not cert_type or "היתר" not in cert_type.group(1):
+            return result  # "לא מצאנו תוצאות עבור החיפוש שלך"
+
+        name = re.search(r"תעודת מורשה היתרים של\s*(.+)", text)
+        issued = re.search(r"תאריך הנפקת התעודה:\s*([\d/]+)", text)
+        result.update(found=True,
+                      cert_number=cert.group(1),
+                      name=name.group(1).strip() if name else None,
+                      issue_date=issued.group(1) if issued else None)
         return result
 
     except Exception as e:
@@ -194,13 +250,6 @@ def search_registry(id_number):
     finally:
         if driver:
             driver.quit()
-
-
-def parse_date(text):
-    try:
-        return datetime.strptime(text, "%d/%m/%Y").date()
-    except (TypeError, ValueError):
-        return None
 
 
 # ---------- עיצוב ותצוגה ----------
@@ -262,12 +311,12 @@ div.stButton > button {
 HERO_HTML = """
 <div class="hero">
   <h1>📜 אימות תעודת מורשה להיתר</h1>
-  <p>בדיקה מהירה של תעודה מול פנקס המהנדסים והאדריכלים של משרד העבודה</p>
+  <p>בדיקה מהירה של התעודה מול רשימת המורשים להיתר של משרד העבודה</p>
 </div>
 <div class="steps">
   <div class="step"><b>שלב 1</b>מעלים את קובץ ה-PDF של התעודה</div>
-  <div class="step"><b>שלב 2</b>המערכת קוראת את מספר ת.ז והרישיון</div>
-  <div class="step"><b>שלב 3</b>הפרטים נבדקים מול הפנקס הרשמי</div>
+  <div class="step"><b>שלב 2</b>המערכת קוראת את מספר ת.ז והתעודה</div>
+  <div class="step"><b>שלב 3</b>הפרטים נבדקים מול הרשימה הרשמית</div>
 </div>
 """
 
@@ -296,59 +345,48 @@ def show_technical_details(search):
 
 
 def show_verdict(search, id_number, pdf_numbers):
-    """מציג תוצאה סופית: נמצא + מס' התעודה מה-PDF תואם + בתוקף"""
+    """מציג תוצאה סופית: נמצא ברשימת המורשים + מס' התעודה מה-PDF תואם"""
     if search["error"]:
         if search.get("blocked"):
             render_card("warning", "🛡️", "אתר משרד העבודה חסם את הבדיקה",
                         "האתר לא מאפשר כרגע גישה אוטומטית מהשרת שלנו. "
-                        "אפשר לנסות שוב בעוד כמה דקות, או לבדוק ידנית באתר הפנקס.")
+                        "אפשר לנסות שוב בעוד כמה דקות, או לבדוק ידנית באתר משרד העבודה.")
         else:
             render_card("warning", "🔌", "לא הצלחנו להשלים את הבדיקה",
                         "נראה שאתר משרד העבודה איטי או לא זמין כרגע. "
                         "זו לא בעיה בתעודה — כדאי לנסות שוב בעוד כמה דקות.")
-        st.link_button("לבדיקה ידנית באתר הפנקס ↗", REGISTRY_URL)
+        st.link_button("לבדיקה ידנית באתר משרד העבודה ↗", PERMIT_URL)
         show_technical_details(search)
         return
 
     if not search["found"]:
-        render_card("error", "❌", "התעודה לא נמצאה בפנקס",
-                    "מספר תעודת הזהות שבתעודה לא רשום בפנקס המהנדסים והאדריכלים. "
+        render_card("error", "❌", "לא נמצאה תעודת מורשה להיתר בתוקף",
+                    "מספר תעודת הזהות שבתעודה לא מופיע ברשימת המורשים להיתר של משרד העבודה. "
+                    "הרשימה כוללת רק מורשים שתעודתם בתוקף, ולכן ייתכן גם שהתעודה פגה או שהאגרה לא שולמה. "
                     "מומלץ לא להסתמך על התעודה ולבקש הבהרה מבעליה.",
                     [("תעודת זהות", id_number)])
         return
 
-    name = search["name"] or "-"
-    matching = [r for r in search["rows"] if r.get("מספר תעודה") in pdf_numbers]
-
-    if not matching:
-        render_card("warning", "⚠️", "נדרשת בדיקה ידנית",
-                    "תעודת הזהות רשומה בפנקס, אבל מספר הרישיון שבתעודה לא תואם את הרשום במאגר. "
-                    "ייתכן שהתעודה שייכת לאדם אחר או שנערכה.",
-                    [("שם במאגר", name), ("תעודת זהות", id_number)])
+    details = [
+        ("שם במאגר", search["name"] or "-"),
+        ("תעודת זהות", id_number),
+        ("מספר תעודה", search["cert_number"]),
+        ("תאריך הנפקה", search["issue_date"] or "-"),
+    ]
+    if pdf_numbers is None:
+        render_card("success", "✅", "נמצא ברשימת המורשים להיתר",
+                    "תעודת הזהות שהוקלדה רשומה ברשימת המורשים להיתר של משרד העבודה, והתעודה בתוקף. "
+                    "שימו לב: נבדקה תעודת הזהות בלבד, ללא השוואה לקובץ תעודה.",
+                    details)
+    elif certificate_number_in_pdf(search["cert_number"], pdf_numbers):
+        render_card("success", "✅", "התעודה אומתה בהצלחה",
+                    "הפרטים בתעודה תואמים לרישום ברשימת המורשים להיתר של משרד העבודה, והתעודה בתוקף.",
+                    details)
     else:
-        expiry_dates = [parse_date(r.get("תאריך תוקף")) for r in matching]
-        valid = any(d is None or d >= date.today() for d in expiry_dates)
-        row = matching[0]
-        details = [
-            ("שם במאגר", name),
-            ("תעודת זהות", id_number),
-            ("מספר רישיון", row.get("מספר תעודה", "-")),
-            ("ענף", row.get("ענף", "-")),
-            ("בתוקף עד", row.get("תאריך תוקף", "-")),
-        ]
-        if valid:
-            render_card("success", "✅", "התעודה אומתה בהצלחה",
-                        "הפרטים בתעודה תואמים לרישום בפנקס המהנדסים והאדריכלים, והרישיון בתוקף.",
-                        details)
-        else:
-            render_card("error", "⏳", "תוקף הרישיון הסתיים",
-                        "הפרטים רשומים בפנקס, אבל תוקף הרישיון הסתיים. "
-                        "ייתכן שתשלום האגרה עוד לא עודכן — כדאי לבדוק שוב בעוד כחודש.",
-                        details)
-
-    if search["rows"]:
-        with st.expander("כל הרישומים שנמצאו בפנקס"):
-            st.table(search["rows"])
+        render_card("warning", "⚠️", "נדרשת בדיקה ידנית",
+                    "תעודת הזהות רשומה ברשימת המורשים להיתר, אבל מספר התעודה שבקובץ לא תואם את הרשום "
+                    "במאגר. ייתכן שזו תעודה ישנה יותר או שהקובץ נערך.",
+                    details)
 
 
 def main():
@@ -359,19 +397,20 @@ def main():
     uploaded_file = st.file_uploader("קובץ התעודה (PDF)", type=["pdf"],
                                      help="יש להעלות את קובץ ה-PDF המקורי של התעודה, לא צילום מסך.")
 
-    with st.expander("המערכת לא הצליחה לקרוא את הקובץ? אפשר להקליד ת.ז ידנית"):
-        manual_id = st.text_input("מספר תעודת זהות (לא חובה)", max_chars=9,
-                                  placeholder="9 ספרות, כולל ספרת ביקורת")
+    with st.expander("אפשר גם להקליד מספר תעודת זהות ידנית"):
+        manual_id = st.text_input("מספר תעודת זהות", max_chars=9, placeholder="9 ספרות, כולל ספרת ביקורת",
+                                  help="אם מעלים קובץ וגם מקלידים מספר, ייבדק המספר שהוקלד.")
 
     if not st.button("🔍 בדיקת התעודה", type="primary", width="stretch",
                      disabled=uploaded_file is None and not manual_id.strip()):
         st.markdown('<div class="footnote">⏱️ הבדיקה לוקחת בדרך כלל כ-10 שניות · '
-                    "מתבצעת מול מאגר ציבורי של משרד העבודה · הקובץ לא נשמר במערכת</div>",
+                    "מתבצעת מול רשימה ציבורית של משרד העבודה · הקובץ לא נשמר במערכת</div>",
                     unsafe_allow_html=True)
         return
 
     with st.status("בודקים את התעודה... התהליך עשוי לקחת כ-10 שניות ⏱️", expanded=True) as status:
         id_number, pdf_numbers, read_error = None, set(), None
+        manual_typed = bool(manual_id.strip())
         if uploaded_file is not None:
             st.write("📄 קוראים את פרטי התעודה מהקובץ...")
             # שמירה לקובץ זמני ייחודי - בטוח גם כשכמה משתמשים מריצים במקביל
@@ -384,37 +423,39 @@ def main():
                 read_error = f"{type(e).__name__}: {e}"
             finally:
                 os.remove(temp_path)
+        else:
+            pdf_numbers = None  # בדיקה לפי ת.ז בלבד
 
-        manual_error = False
-        if manual_id.strip():
+        if manual_typed:
             # ת.ז שהוקלדה ידנית גוברת על מה שנקרא מהקובץ
             id_number = normalize_id(manual_id)
-            manual_error = id_number is None
 
         if not id_number:
             status.update(label="לא הצלחנו לקרוא את התעודה", state="error", expanded=False)
         else:
             st.write(f"🔢 נמצאה תעודת זהות: **{id_number}**")
-            st.write("🌐 בודקים מול פנקס המהנדסים והאדריכלים, זה עשוי לקחת כ-10 שניות...")
-            search = search_registry(id_number)
+            st.write("🌐 בודקים מול רשימת המורשים להיתר, זה עשוי לקחת כ-10 שניות...")
+            search = search_permit_holder(id_number)
             if search["error"]:
                 status.update(label="הבדיקה לא הושלמה", state="error", expanded=False)
             else:
                 status.update(label="הבדיקה הושלמה", state="complete", expanded=False)
 
+    if not id_number and manual_typed:
+        render_card("warning", "🔢", "מספר תעודת הזהות שהוקלד לא תקין",
+                    "יש לבדוק שהוקלדו 9 ספרות מלאות, כולל ספרת הביקורת בסוף.")
+        return
+
     if not id_number:
-        if manual_error:
-            render_card("warning", "🔢", "מספר תעודת הזהות שהוקלד לא תקין",
-                        "יש לבדוק שהוקלדו 9 ספרות מלאות, כולל ספרת הביקורת בסוף.")
-            return
         render_card("warning", "📄", "לא מצאנו מספר תעודת זהות בקובץ",
-                    "ייתכן שהקובץ סרוק או בנוי אחרת מהרגיל. אפשר להקליד את מספר ת.ז ידנית "
-                    "בחלון \"אפשר להקליד ת.ז ידנית\" שמעל הכפתור, וללחוץ שוב על בדיקה.")
+                    "כדאי לוודא שזה קובץ ה-PDF המקורי שהתקבל ממשרד העבודה. "
+                    "קובץ סרוק או צילום מסך לא מכיל טקסט שאפשר לקרוא. "
+                    "אפשר להקליד את מספר תעודת הזהות ידנית בחלונית שמעל הכפתור.")
         with st.expander("פרטים טכניים (למי שמתחזק את המערכת)"):
             if read_error:
                 st.code(f"שגיאה בקריאת ה-PDF: {read_error}", language=None)
             else:
-                found = sorted(pdf_numbers, key=len, reverse=True)
+                found = sorted(pdf_numbers or [], key=len, reverse=True)
                 st.code("מספרים שנמצאו בקובץ: " + (", ".join(found) if found else "(אין טקסט בקובץ - כנראה סרוק)"),
                         language=None)
         return
